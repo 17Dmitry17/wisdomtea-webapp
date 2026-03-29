@@ -1,322 +1,231 @@
-import sqlite3
+from flask import Flask, render_template, jsonify, request
+import db
+import telebot
+import os
 
-DB = 'wisdomtea.db'
+app = Flask(__name__)
 
-def conn():
-    c = sqlite3.connect(DB)
-    c.row_factory = sqlite3.Row
-    return c
+BOT_TOKEN = os.getenv('BOT_TOKEN', 'YOUR_TOKEN_HERE')
+ADMIN_ID = int(os.getenv('ADMIN_ID', '123456789'))
+ADMIN_SECRET = os.getenv('ADMIN_SECRET', 'wisdomtea_admin_2024')
 
-def init():
-    c = conn()
-    c.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tg_id INTEGER UNIQUE,
-            username TEXT,
-            full_name TEXT,
-            phone TEXT,
-            address TEXT
-        );
-        CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            category TEXT,
-            form TEXT,
-            name TEXT,
-            year INTEGER,
-            weight INTEGER,
-            price INTEGER,
-            description TEXT,
-            stock INTEGER DEFAULT 0,
-            photo_id TEXT,
-            is_active INTEGER DEFAULT 1
-        );
-        CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tg_id INTEGER,
-            items TEXT,
-            total INTEGER,
-            status TEXT DEFAULT 'Новый',
-            fio TEXT,
-            phone TEXT,
-            address TEXT,
-            promo TEXT,
-            discount INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS favorites (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tg_id INTEGER,
-            product_id INTEGER,
-            UNIQUE(tg_id, product_id)
-        );
-        CREATE TABLE IF NOT EXISTS reviews (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tg_id INTEGER,
-            product_id INTEGER,
-            rating INTEGER,
-            text TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS promocodes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            code TEXT UNIQUE,
-            discount INTEGER,
-            uses_left INTEGER DEFAULT -1,
-            is_active INTEGER DEFAULT 1
-        );
-    """)
-    # Миграции для существующих БД
-    migrations = [
-        ('users', 'address', 'TEXT'),
-        ('products', 'stock', 'INTEGER DEFAULT 0'),
-        ('products', 'photo_id', 'TEXT'),
-        ('orders', 'fio', 'TEXT'),
-        ('orders', 'phone', 'TEXT'),
-        ('orders', 'address', 'TEXT'),
-        ('orders', 'promo', 'TEXT'),
-        ('orders', 'discount', 'INTEGER DEFAULT 0'),
-    ]
-    for table, col, definition in migrations:
-        try:
-            c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {definition}")
-            c.commit()
-        except Exception:
-            pass
-    c.close()
+bot = telebot.TeleBot(BOT_TOKEN)
 
-# ── Пользователи ──────────────────────────────────────────────
+CATEGORIES = {
+    'cat_oolong': '🌊 Улуны',
+    'cat_green':  '🌿 Зелёный чай',
+    'cat_shu':    '🏺 Шу пуэры',
+    'cat_shen':   '🌱 Шэн пуэры',
+    'cat_white':  '🤍 Белый чай',
+    'cat_red':    '🍂 Красный чай',
+}
 
-def save_user(tg_id, username, full_name, phone=None, address=None):
-    c = conn()
-    c.execute("INSERT OR IGNORE INTO users (tg_id, username, full_name) VALUES (?,?,?)",
-              (tg_id, username, full_name))
-    if phone:
-        c.execute("UPDATE users SET phone=? WHERE tg_id=?", (phone, tg_id))
-    if address:
-        c.execute("UPDATE users SET address=? WHERE tg_id=?", (address, tg_id))
-    c.commit()
-    c.close()
+def is_admin(req):
+    return req.headers.get('X-Admin-Secret') == ADMIN_SECRET
 
-def get_user(tg_id):
-    c = conn()
-    row = c.execute("SELECT * FROM users WHERE tg_id=?", (tg_id,)).fetchone()
-    c.close()
-    return row
+# ── Страницы ──────────────────────────────────────────────────
 
-def get_all_users():
-    c = conn()
-    rows = c.execute("SELECT * FROM users").fetchall()
-    c.close()
-    return rows
+@app.route('/')
+def index():
+    return render_template('index.html')
 
-# ── Товары ────────────────────────────────────────────────────
+# ── API: каталог ──────────────────────────────────────────────
 
-def add_product(category, form, name, year, weight, price, description, stock=0, photo_id=None):
-    c = conn()
-    c.execute(
-        "INSERT INTO products (category,form,name,year,weight,price,description,stock,photo_id) VALUES (?,?,?,?,?,?,?,?,?)",
-        (category, form, name, year, weight, price, description, stock, photo_id)
+@app.route('/api/categories')
+def api_categories():
+    return jsonify(CATEGORIES)
+
+@app.route('/api/products')
+def api_products():
+    category = request.args.get('category')
+    form = request.args.get('form')
+    if category and form:
+        products = db.get_products(category, form)
+    else:
+        products = db.get_all_products()
+    return jsonify([dict(p) for p in products])
+
+@app.route('/api/product/<int:pid>')
+def api_product(pid):
+    p = db.get_product(pid)
+    if not p:
+        return jsonify({'error': 'not found'}), 404
+    reviews = db.reviews_get(pid)
+    avg_rating = round(sum(r['rating'] for r in reviews) / len(reviews), 1) if reviews else None
+    result = dict(p)
+    result['avg_rating'] = avg_rating
+    result['review_count'] = len(reviews)
+    return jsonify(result)
+
+# ── API: заказ ────────────────────────────────────────────────
+
+@app.route('/api/order', methods=['POST'])
+def api_order():
+    data = request.json
+    tg_id   = data.get('tg_id')
+    items   = data.get('items', [])
+    fio     = data.get('fio', '')
+    phone   = data.get('phone', '')
+    address = data.get('address', '')
+    promo   = data.get('promo', '')
+
+    if not items:
+        return jsonify({'error': 'missing data'}), 400
+
+    discount = 0
+    promo_code = None
+    if promo:
+        p = db.promo_check(promo)
+        if p:
+            discount = p['discount']
+            promo_code = p['code']
+            db.promo_use(promo_code)
+
+    total = sum(i['price'] * i['qty'] for i in items)
+    final_total = max(0, total - discount)
+    lines = [f"{i['name']} ({i['weight']}г) × {i['qty']} шт. — {i['price'] * i['qty']}₽" for i in items]
+    items_text = '\n'.join(lines)
+
+    oid = db.save_order(tg_id or 0, items_text, final_total, fio, phone, address, promo_code, discount)
+    if tg_id:
+        db.save_user(tg_id, data.get('username', ''), data.get('full_name', ''), phone)
+
+    discount_str = f'\n🎁 Скидка: {discount}₽ (промокод: {promo_code})' if promo_code else ''
+    admin_text = (
+        f'🔔 <b>Новый заказ №{oid}</b>\n\n'
+        f'👤 {fio}\n📱 {phone}\n🏠 СДЭК: {address}\n\n'
+        f'Состав:\n{items_text}\n{discount_str}\n💰 Итого: {final_total}₽'
     )
-    c.commit()
-    c.close()
-
-def get_products(category, form):
-    c = conn()
-    rows = c.execute(
-        "SELECT * FROM products WHERE category=? AND form=? AND is_active=1",
-        (category, form)
-    ).fetchall()
-    c.close()
-    return rows
-
-def get_product(pid):
-    c = conn()
-    row = c.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
-    c.close()
-    return row
-
-def get_all_products():
-    c = conn()
-    rows = c.execute("SELECT * FROM products WHERE is_active=1 ORDER BY category, name").fetchall()
-    c.close()
-    return rows
-
-def update_product(pid, name, price, stock, description, year):
-    c = conn()
-    c.execute(
-        "UPDATE products SET name=?, price=?, stock=?, description=?, year=? WHERE id=?",
-        (name, price, stock, description, year, pid)
-    )
-    c.commit()
-    c.close()
-
-def update_photo(pid, photo_id):
-    c = conn()
-    c.execute("UPDATE products SET photo_id=? WHERE id=?", (photo_id, pid))
-    c.commit()
-    c.close()
-
-def delete_product(pid):
-    c = conn()
-    c.execute("UPDATE products SET is_active=0 WHERE id=?", (pid,))
-    c.commit()
-    c.close()
-
-def get_top_products(limit=3):
-    """Топ товаров по количеству заказов (для рекомендаций)."""
-    c = conn()
-    rows = c.execute(
-        "SELECT * FROM products WHERE is_active=1 ORDER BY RANDOM() LIMIT ?", (limit,)
-    ).fetchall()
-    c.close()
-    return rows
-
-# ── Заказы ────────────────────────────────────────────────────
-
-def save_order(tg_id, items_text, total, fio, phone, address, promo=None, discount=0):
-    c = conn()
-    cur = c.execute(
-        "INSERT INTO orders (tg_id,items,total,fio,phone,address,promo,discount) VALUES (?,?,?,?,?,?,?,?)",
-        (tg_id, items_text, total, fio, phone, address, promo, discount)
-    )
-    oid = cur.lastrowid
-    c.commit()
-    c.close()
-    return oid
-
-def get_orders(tg_id):
-    c = conn()
-    rows = c.execute("SELECT * FROM orders WHERE tg_id=? ORDER BY created_at DESC", (tg_id,)).fetchall()
-    c.close()
-    return rows
-
-def get_order(oid):
-    c = conn()
-    row = c.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
-    c.close()
-    return row
-
-def set_order_status(oid, status):
-    c = conn()
-    c.execute("UPDATE orders SET status=? WHERE id=?", (status, oid))
-    c.commit()
-    c.close()
-
-def get_all_orders():
-    c = conn()
-    rows = c.execute("""
-        SELECT o.*, u.username, u.full_name
-        FROM orders o LEFT JOIN users u ON o.tg_id = u.tg_id
-        ORDER BY o.created_at DESC
-    """).fetchall()
-    c.close()
-    return rows
-
-def get_stats():
-    c = conn()
-    total_orders = c.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
-    total_revenue = c.execute("SELECT COALESCE(SUM(total),0) FROM orders").fetchone()[0]
-    total_users = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    top_products = c.execute("""
-        SELECT p.name, COUNT(*) as cnt
-        FROM orders o
-        JOIN products p ON o.items LIKE '%' || p.name || '%'
-        GROUP BY p.name ORDER BY cnt DESC LIMIT 5
-    """).fetchall()
-    c.close()
-    return total_orders, total_revenue, total_users, top_products
-
-# ── Избранное ─────────────────────────────────────────────────
-
-def fav_add(tg_id, pid):
-    c = conn()
     try:
-        c.execute("INSERT INTO favorites (tg_id, product_id) VALUES (?,?)", (tg_id, pid))
-        c.commit()
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.add(telebot.types.InlineKeyboardButton(
+            '📋 Управление заказом', callback_data=f'adm_order_{oid}'))
+        bot.send_message(ADMIN_ID, admin_text, reply_markup=markup, parse_mode='HTML')
     except Exception:
         pass
-    c.close()
 
-def fav_remove(tg_id, pid):
-    c = conn()
-    c.execute("DELETE FROM favorites WHERE tg_id=? AND product_id=?", (tg_id, pid))
-    c.commit()
-    c.close()
+    return jsonify({'order_id': oid, 'total': final_total, 'discount': discount})
 
-def fav_get(tg_id):
-    c = conn()
-    rows = c.execute("""
-        SELECT p.* FROM favorites f
-        JOIN products p ON p.id = f.product_id
-        WHERE f.tg_id=? AND p.is_active=1
-    """, (tg_id,)).fetchall()
-    c.close()
-    return rows
+@app.route('/api/promo/<code>')
+def api_promo(code):
+    p = db.promo_check(code)
+    if not p:
+        return jsonify({'valid': False})
+    return jsonify({'valid': True, 'discount': p['discount'], 'code': p['code']})
 
-def fav_check(tg_id, pid):
-    c = conn()
-    row = c.execute("SELECT id FROM favorites WHERE tg_id=? AND product_id=?", (tg_id, pid)).fetchone()
-    c.close()
-    return row is not None
+@app.route('/api/orders/<int:tg_id>')
+def api_orders(tg_id):
+    orders = db.get_orders(tg_id)
+    result = []
+    for o in orders:
+        d = dict(o)
+        d['created_at'] = str(d['created_at'])[:10]
+        result.append(d)
+    return jsonify(result)
 
-# ── Отзывы ────────────────────────────────────────────────────
+# ── ADMIN API ─────────────────────────────────────────────────
 
-def review_add(tg_id, pid, rating, text):
-    c = conn()
-    c.execute("INSERT OR REPLACE INTO reviews (tg_id,product_id,rating,text) VALUES (?,?,?,?)",
-              (tg_id, pid, rating, text))
-    c.commit()
-    c.close()
+@app.route('/api/admin/login', methods=['POST'])
+def admin_login():
+    data = request.json
+    if data.get('secret') == ADMIN_SECRET:
+        return jsonify({'ok': True})
+    return jsonify({'ok': False}), 403
 
-def reviews_get(pid):
-    c = conn()
-    rows = c.execute("""
-        SELECT r.*, u.full_name, u.username FROM reviews r
-        LEFT JOIN users u ON u.tg_id = r.tg_id
-        WHERE r.product_id=? ORDER BY r.created_at DESC LIMIT 5
-    """, (pid,)).fetchall()
-    c.close()
-    return rows
+@app.route('/api/admin/products', methods=['GET'])
+def admin_get_products():
+    if not is_admin(request):
+        return jsonify({'error': 'forbidden'}), 403
+    products = db.get_all_products()
+    return jsonify([dict(p) for p in products])
 
-# ── Промокоды ─────────────────────────────────────────────────
+@app.route('/api/admin/product', methods=['POST'])
+def admin_add_product():
+    if not is_admin(request):
+        return jsonify({'error': 'forbidden'}), 403
+    data = request.json
+    db.add_product(
+        data['category'], data['form'], data['name'],
+        data.get('year') or None, int(data['weight']),
+        int(data['price']), data.get('description', ''),
+        int(data.get('stock', 0))
+    )
+    return jsonify({'ok': True})
 
-def promo_check(code):
-    c = conn()
-    row = c.execute(
-        "SELECT * FROM promocodes WHERE code=? AND is_active=1 AND (uses_left=-1 OR uses_left>0)",
-        (code.upper(),)
-    ).fetchone()
-    c.close()
-    return row
+@app.route('/api/admin/product/<int:pid>', methods=['PUT'])
+def admin_update_product(pid):
+    if not is_admin(request):
+        return jsonify({'error': 'forbidden'}), 403
+    data = request.json
+    db.update_product(pid, data['name'], int(data['price']),
+                      int(data['stock']), data.get('description', ''),
+                      data.get('year') or None)
+    return jsonify({'ok': True})
 
-def promo_use(code):
-    c = conn()
-    c.execute("UPDATE promocodes SET uses_left=uses_left-1 WHERE code=? AND uses_left>0", (code.upper(),))
-    c.commit()
-    c.close()
+@app.route('/api/admin/product/<int:pid>', methods=['DELETE'])
+def admin_delete_product(pid):
+    if not is_admin(request):
+        return jsonify({'error': 'forbidden'}), 403
+    db.delete_product(pid)
+    return jsonify({'ok': True})
 
-def promo_add(code, discount, uses=-1):
-    c = conn()
+@app.route('/api/admin/orders', methods=['GET'])
+def admin_get_orders():
+    if not is_admin(request):
+        return jsonify({'error': 'forbidden'}), 403
+    orders = db.get_all_orders()
+    result = []
+    for o in orders:
+        d = dict(o)
+        d['created_at'] = str(d['created_at'])[:16]
+        result.append(d)
+    return jsonify(result)
+
+@app.route('/api/admin/order/<int:oid>/status', methods=['PUT'])
+def admin_update_status(oid):
+    if not is_admin(request):
+        return jsonify({'error': 'forbidden'}), 403
+    data = request.json
+    db.set_order_status(oid, data['status'])
+    o = db.get_order(oid)
+    status_emoji = {'Новый':'🆕','Принят в работу':'⚙️','Собран':'📦','Отправлен':'🚚','Завершён':'✅'}
+    emoji = status_emoji.get(data['status'], '📍')
     try:
-        c.execute("INSERT INTO promocodes (code,discount,uses_left) VALUES (?,?,?)",
-                  (code.upper(), discount, uses))
-        c.commit()
+        bot.send_message(o['tg_id'],
+            f'{emoji} Статус заказа №{oid} обновлён:\n\n<b>{data["status"]}</b>',
+            parse_mode='HTML')
     except Exception:
         pass
-    c.close()
+    return jsonify({'ok': True})
 
-def promo_list():
-    c = conn()
-    rows = c.execute("SELECT * FROM promocodes ORDER BY id DESC").fetchall()
-    c.close()
-    return rows
+@app.route('/api/admin/stats', methods=['GET'])
+def admin_stats():
+    if not is_admin(request):
+        return jsonify({'error': 'forbidden'}), 403
+    total_orders, total_revenue, total_users, _ = db.get_stats()
+    return jsonify({'orders': total_orders, 'revenue': total_revenue, 'users': total_users})
 
-def promo_toggle(pid):
-    c = conn()
-    c.execute("UPDATE promocodes SET is_active=1-is_active WHERE id=?", (pid,))
-    c.commit()
-    c.close()
+@app.route('/api/admin/promos', methods=['GET'])
+def admin_get_promos():
+    if not is_admin(request):
+        return jsonify({'error': 'forbidden'}), 403
+    return jsonify([dict(p) for p in db.promo_list()])
 
-init()
-print("DB OK")
+@app.route('/api/admin/promo', methods=['POST'])
+def admin_add_promo():
+    if not is_admin(request):
+        return jsonify({'error': 'forbidden'}), 403
+    data = request.json
+    db.promo_add(data['code'], int(data['discount']), int(data.get('uses', -1)))
+    return jsonify({'ok': True})
+
+@app.route('/api/admin/promo/<int:pid>/toggle', methods=['PUT'])
+def admin_toggle_promo(pid):
+    if not is_admin(request):
+        return jsonify({'error': 'forbidden'}), 403
+    db.promo_toggle(pid)
+    return jsonify({'ok': True})
+
+if __name__ == '__main__':
+    port = int(os.getenv('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)

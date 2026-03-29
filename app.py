@@ -5,8 +5,8 @@ import os
 
 app = Flask(__name__)
 
-BOT_TOKEN = os.getenv('BOT_TOKEN', 'YOUR_TOKEN_HERE')
-ADMIN_ID = int(os.getenv('ADMIN_ID', '123456789'))
+BOT_TOKEN = os.getenv('BOT_TOKEN', '7597277963:AAErBOgaEeTigKBYZxQppYOpv8MhhyYwMJA')
+ADMIN_ID = int(os.getenv('ADMIN_ID', '760339812'))
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
